@@ -110,6 +110,7 @@ void	tcache_bin_flush_large(tcache_bin_t *tbin, size_t binind, unsigned rem,
     tcache_t *tcache);
 void	tcache_arena_associate(tcache_t *tcache, arena_t *arena);
 void	tcache_arena_dissociate(tcache_t *tcache);
+tcache_t *tcache_get_hard(tcache_t *tcache, bool create);
 tcache_t *tcache_create(arena_t *arena);
 void	tcache_destroy(tcache_t *tcache);
 void	tcache_thread_cleanup(void *arg);
@@ -220,39 +221,7 @@ tcache_get(bool create)
 	if ((uintptr_t)tcache <= (uintptr_t)TCACHE_STATE_MAX) {
 		if (tcache == TCACHE_STATE_DISABLED)
 			return (NULL);
-		if (tcache == NULL) {
-			if (create == false) {
-				/*
-				 * Creating a tcache here would cause
-				 * allocation as a side effect of free().
-				 * Ordinarily that would be okay since
-				 * tcache_create() failure is a soft failure
-				 * that doesn't propagate.  However, if TLS
-				 * data are freed via free() as in glibc,
-				 * subtle corruption could result from setting
-				 * a TLS variable after its backing memory is
-				 * freed.
-				 */
-				return (NULL);
-			}
-			if (tcache_enabled_get() == false) {
-				tcache_enabled_set(false); /* Memoize. */
-				return (NULL);
-			}
-			return (tcache_create(choose_arena(NULL)));
-		}
-		if (tcache == TCACHE_STATE_PURGATORY) {
-			/*
-			 * Make a note that an allocator function was called
-			 * after tcache_thread_cleanup() was called.
-			 */
-			tcache = TCACHE_STATE_REINCARNATED;
-			tcache_tsd_set(&tcache);
-			return (NULL);
-		}
-		if (tcache == TCACHE_STATE_REINCARNATED)
-			return (NULL);
-		not_reached();
+		tcache = tcache_get_hard(tcache, create);
 	}
 
 	return (tcache);
@@ -294,17 +263,17 @@ tcache_alloc_small(tcache_t *tcache, size_t size, bool zero)
 	size_t binind;
 	tcache_bin_t *tbin;
 
-	binind = SMALL_SIZE2BIN(size);
+	binind = small_size2bin(size);
 	assert(binind < NBINS);
 	tbin = &tcache->tbins[binind];
-	size = arena_bin_info[binind].reg_size;
+	size = small_bin2size(binind);
 	ret = tcache_alloc_easy(tbin);
 	if (ret == NULL) {
 		ret = tcache_alloc_small_hard(tcache, tbin, binind);
 		if (ret == NULL)
 			return (NULL);
 	}
-	assert(tcache_salloc(ret) == arena_bin_info[binind].reg_size);
+	assert(tcache_salloc(ret) == size);
 
 	if (zero == false) {
 		if (config_fill) {
@@ -314,20 +283,18 @@ tcache_alloc_small(tcache_t *tcache, size_t size, bool zero)
 			} else if (opt_zero)
 				memset(ret, 0, size);
 		}
-		VALGRIND_MAKE_MEM_UNDEFINED(ret, size);
 	} else {
 		if (config_fill && opt_junk) {
 			arena_alloc_junk_small(ret, &arena_bin_info[binind],
 			    true);
 		}
-		VALGRIND_MAKE_MEM_UNDEFINED(ret, size);
 		memset(ret, 0, size);
 	}
 
 	if (config_stats)
 		tbin->tstats.nrequests++;
 	if (config_prof)
-		tcache->prof_accumbytes += arena_bin_info[binind].reg_size;
+		tcache->prof_accumbytes += size;
 	tcache_event(tcache);
 	return (ret);
 }
@@ -354,7 +321,7 @@ tcache_alloc_large(tcache_t *tcache, size_t size, bool zero)
 		if (ret == NULL)
 			return (NULL);
 	} else {
-		if (config_prof && prof_promote && size == PAGE) {
+		if (config_prof && size == PAGE) {
 			arena_chunk_t *chunk =
 			    (arena_chunk_t *)CHUNK_ADDR2BASE(ret);
 			size_t pageind = (((uintptr_t)ret - (uintptr_t)chunk) >>
@@ -369,11 +336,8 @@ tcache_alloc_large(tcache_t *tcache, size_t size, bool zero)
 				else if (opt_zero)
 					memset(ret, 0, size);
 			}
-			VALGRIND_MAKE_MEM_UNDEFINED(ret, size);
-		} else {
-			VALGRIND_MAKE_MEM_UNDEFINED(ret, size);
+		} else
 			memset(ret, 0, size);
-		}
 
 		if (config_stats)
 			tbin->tstats.nrequests++;
